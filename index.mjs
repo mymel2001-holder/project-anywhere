@@ -1,4 +1,4 @@
-// doh-proxy-full.mjs
+// doh-reverse-hosts.mjs
 import fs from "fs";
 import http from "http";
 import https from "https";
@@ -14,8 +14,8 @@ const HOSTS_FILE = process.env.HOSTS_FILE || "./hosts.json";
 const PROXY_HOST = process.env.PROXY_HOST || "anywhere.nodemixaholic.com";
 const IGNORE_TLS = (process.env.IGNORE_TLS || "true").toLowerCase() === "true";
 
-// Mapping: client queried hostname -> { targets: [IP,...], isLocal: bool }
-const mapping = new Map();
+// Mapping: client-visible hostname -> { targets: [IP], isLocal }
+let mapping = new Map();
 
 // Load hosts.json
 function loadHosts() {
@@ -39,7 +39,7 @@ fs.watchFile(HOSTS_FILE, { interval: 1000 }, () => {
   hosts = loadHosts();
 });
 
-// Detect private/local IPs
+// Detect private/local IP
 function isPrivateIp(ip) {
   if (!ip) return false;
   const v4 = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
@@ -56,10 +56,10 @@ async function resolveProxyHostIPs() {
   const results = [];
   try { results.push(...await dns.resolve4(PROXY_HOST).catch(()=>[])); } catch {}
   try { results.push(...await dns.resolve6(PROXY_HOST).catch(()=>[])); } catch {}
-  return results;
+  return results.length ? results : ["127.0.0.1"];
 }
 
-// Resolve a list of hostnames/IPs to IPs
+// Resolve hostnames in hosts.json entries to IPs
 async function resolveHostsEntry(entry) {
   const resolved = [];
   for (const t of entry) {
@@ -67,10 +67,9 @@ async function resolveHostsEntry(entry) {
       resolved.push(t);
     } else {
       try {
-        const ips4 = await dns.resolve4(t).catch(()=>[]);
-        const ips6 = await dns.resolve6(t).catch(()=>[]);
-        resolved.push(...ips4, ...ips6);
-      } catch(e) {
+        resolved.push(...await dns.resolve4(t).catch(()=>[]));
+        resolved.push(...await dns.resolve6(t).catch(()=>[]));
+      } catch(e){
         console.warn(`Failed to resolve ${t}: ${e.message}`);
       }
     }
@@ -176,20 +175,10 @@ app.all(/.*/, async (req,res)=>{
 
         if(localTargets.length){
           const proxyIps = await resolveProxyHostIPs();
-          if(proxyIps.length === 0){
-            console.warn("Could not resolve PROXY_HOST; using 127.0.0.1 as fallback");
-            proxyIps.push("127.0.0.1");
-          }
-
-          mapping.set(lowerName, { targets: localTargets, isLocal: true });
-          const answers = proxyIps.map(ip => ({
-            name: lowerName,
-            type: ip.includes(":") ? 28 : 1,
-            TTL: 300,
-            data: ip
-          }));
-          return res.json({ Status: 0, Answer: answers });
-
+          mapping.set(name,{ targets: localTargets, isLocal:true });
+          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
         }
 
         if(publicTargets.length){
@@ -276,9 +265,9 @@ app.all(/.*/, async (req,res)=>{
 });
 
 http.createServer(app).listen(PORT,()=>{
-  console.log(`DOH+Reverse Proxy listening on http://0.0.0.0:${PORT}`);
+  console.log(`DOH + Reverse Proxy listening on http://0.0.0.0:${PORT}`);
   console.log(`Upstream DOH: ${UPSTREAM}`);
-  console.log(`Hosts: ${HOSTS_FILE}`);
+  console.log(`Hosts file: ${HOSTS_FILE}`);
   console.log(`Proxy host: ${PROXY_HOST}`);
   console.log(`IGNORE_TLS: ${IGNORE_TLS}`);
 });
