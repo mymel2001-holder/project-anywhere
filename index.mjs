@@ -1,12 +1,10 @@
-// doh-reverse-hosts.mjs
+// doh-reverse-fixed.mjs
 import fs from "fs";
 import http from "http";
 import https from "https";
 import express from "express";
 import fetch from "node-fetch";
 import dnsPacket from "dns-packet";
-import dns from "dns/promises";
-import { URL } from "url";
 
 const PORT = Number(process.env.PORT || 8053);
 const UPSTREAM = process.env.UPSTREAM_DOH || "https://one.one.one.one/dns-query";
@@ -14,7 +12,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE || "./hosts.json";
 const PROXY_HOST = process.env.PROXY_HOST || "anywhere.nodemixaholic.com";
 const IGNORE_TLS = (process.env.IGNORE_TLS || "true").toLowerCase() === "true";
 
-// Mapping: client-visible hostname -> { targets: [IP], isLocal }
+// hostname -> { targets: [IP], isLocal }
 let mapping = new Map();
 
 // Load hosts.json
@@ -39,7 +37,7 @@ fs.watchFile(HOSTS_FILE, { interval: 1000 }, () => {
   hosts = loadHosts();
 });
 
-// Detect private/local IP
+// Detect private IP
 function isPrivateIp(ip) {
   if (!ip) return false;
   const v4 = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
@@ -51,14 +49,6 @@ function isPrivateIp(ip) {
   return lower === "::1" || lower.startsWith("fe80:") || /^f[cd]/.test(lower);
 }
 
-// Resolve PROXY_HOST to IPs
-async function resolveProxyHostIPs() {
-  const results = [];
-  try { results.push(...await dns.resolve4(PROXY_HOST).catch(()=>[])); } catch {}
-  try { results.push(...await dns.resolve6(PROXY_HOST).catch(()=>[])); } catch {}
-  return results.length ? results : ["127.0.0.1"];
-}
-
 // Resolve hostnames in hosts.json entries to IPs
 async function resolveHostsEntry(entry) {
   const resolved = [];
@@ -66,12 +56,7 @@ async function resolveHostsEntry(entry) {
     if (isPrivateIp(t) || t.match(/^\d+(\.\d+){3}$/) || t.includes(":")) {
       resolved.push(t);
     } else {
-      try {
-        resolved.push(...await dns.resolve4(t).catch(()=>[]));
-        resolved.push(...await dns.resolve6(t).catch(()=>[]));
-      } catch(e){
-        console.warn(`Failed to resolve ${t}: ${e.message}`);
-      }
+      resolved.push(t); // Keep as-is for public hostname
     }
   }
   return resolved;
@@ -81,10 +66,7 @@ async function resolveHostsEntry(entry) {
 async function forwardToUpstreamWire(buf) {
   const res = await fetch(UPSTREAM, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/dns-message",
-      "Accept": "application/dns-message"
-    },
+    headers: { "Content-Type":"application/dns-message", "Accept":"application/dns-message" },
     body: buf
   });
   const arrayBuffer = await res.arrayBuffer();
@@ -93,7 +75,7 @@ async function forwardToUpstreamWire(buf) {
   return { buffer: Buffer.from(arrayBuffer), headers, status: res.status };
 }
 
-// Build DNS answer packet
+// Build DNS packet
 function buildDnsAnswerPacket(queryBuffer, rrList) {
   const q = dnsPacket.decode(queryBuffer);
   return dnsPacket.encode({
@@ -101,7 +83,7 @@ function buildDnsAnswerPacket(queryBuffer, rrList) {
     type: "response",
     flags: q.flags,
     questions: q.questions,
-    answers: rrList.map(r => ({ name: r.name, type: r.type, ttl: r.ttl || 300, class: "IN", data: r.data }))
+    answers: rrList.map(r => ({ name: r.name, type: r.type, ttl: r.ttl || 300, class:"IN", data: r.data }))
   });
 }
 
@@ -174,7 +156,7 @@ app.all(/.*/, async (req,res)=>{
         const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
 
         if(localTargets.length){
-          const proxyIps = await resolveProxyHostIPs();
+          const proxyIps = [PROXY_HOST]; // <-- always use DOH server hostname
           mapping.set(name,{ targets: localTargets, isLocal:true });
           const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
@@ -206,7 +188,7 @@ app.all(/.*/, async (req,res)=>{
         const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
 
         if(localTargets.length){
-          const proxyIps = await resolveProxyHostIPs();
+          const proxyIps = [PROXY_HOST];
           mapping.set(name,{ targets: localTargets, isLocal:true });
           const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
@@ -239,22 +221,18 @@ app.all(/.*/, async (req,res)=>{
         const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
 
         if(localTargets.length){
-          const proxyIps = await resolveProxyHostIPs();
           mapping.set(lower,{ targets: localTargets, isLocal:true });
-          return res.json({ Status:0, Answer: proxyIps.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
+          return res.json({ Status:0, Answer: [ { name:lower, type:1, TTL:300, data:PROXY_HOST } ] });
         }
 
         if(publicTargets.length){
           mapping.set(lower,{ targets: publicTargets, isLocal:false });
-          return res.json({ Status:0, Answer: publicTargets.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
+          return res.json({ Status:0, Answer: publicTargets.map(ip=>({ name:lower, type:1, TTL:300, data:ip })) });
         }
       }
 
       // fallback upstream
-      const u = new URL(UPSTREAM);
-      u.searchParams.set("name", name);
-      u.searchParams.set("type", type);
-      const r = await fetch(String(u), { headers:{ Accept:"application/dns-json" } });
+      const r = await fetch(`${UPSTREAM}?name=${name}&type=${type}`,{ headers:{ Accept:"application/dns-json" } });
       const j = await r.json().catch(()=>null);
       if(j) return res.status(r.status).json(j);
       return res.status(502).json({ Status:2, Comment:"upstream failed" });
