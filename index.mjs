@@ -306,7 +306,14 @@ app.all(/.*/, async (req, res) => {
       const headers = { ...req.headers };
       delete headers.host;
       try {
-        const upstreamRes = await fetch(UPSTREAM, { method: req.method, headers, body, redirect: "follow" });
+        const upstreamRes = await fetch(UPSTREAM, {
+          method: "POST",
+            headers: {
+              "Content-Type": "application/dns-message",
+              "Accept": "application/dns-message"
+            },
+         body: body
+	});
         const buf = Buffer.from(await upstreamRes.arrayBuffer());
         if (upstreamRes.headers.get("content-type")) res.setHeader("content-type", upstreamRes.headers.get("content-type"));
         if (upstreamRes.headers.get("content-encoding")) res.setHeader("content-encoding", upstreamRes.headers.get("content-encoding"));
