@@ -28,7 +28,7 @@ async function initProxyConfig() {
     PROXY_IP_FOR_PUBLIC_A_RECORDS = PROXY_HOST_INPUT;
   } else {
     try {
-      console.log(`Resolving PROXY_HOST (${PROXY_HOST_INPUT}) to get an IP for optional A records...`);
+      console.log(`Resolving PROXY_HOST ${PROXY_HOST_INPUT} to get an IP for optional A records...`);
       const { address } = await dnsLookup(PROXY_HOST_INPUT);
       PROXY_IP_FOR_PUBLIC_A_RECORDS = address;
       console.log(`Resolved PROXY_HOST for A-records: ${PROXY_IP_FOR_PUBLIC_A_RECORDS}`);
