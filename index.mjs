@@ -1,337 +1,249 @@
-// doh-proxy.mjs
-// Node.js DOH proxy that supports hosts.json override and upstream DOH forwarding.
-// Usage: node doh-proxy.mjs
-// Env:
-//   UPSTREAM_DOH (default: https://one.one.one.one/dns-query)
-//   HOSTS_FILE  (default: ./hosts.json)
-//   PORT        (default: 8053)
-
+// doh-proxy-full.mjs
 import fs from "fs";
 import http from "http";
+import https from "https";
 import express from "express";
-import fetch from "node-fetch"; // safe fallback; Node 18+ has global fetch
+import fetch from "node-fetch";
 import dnsPacket from "dns-packet";
+import dns from "dns/promises";
 import { URL } from "url";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 8053;
+const PORT = Number(process.env.PORT || 8053);
 const UPSTREAM = process.env.UPSTREAM_DOH || "https://one.one.one.one/dns-query";
 const HOSTS_FILE = process.env.HOSTS_FILE || "./hosts.json";
+const PROXY_HOST = process.env.PROXY_HOST || "anywhere.nodemixaholic.com";
+const PROXY_PATH = process.env.PROXY_PATH || "/proxy";
+const IGNORE_TLS = (process.env.IGNORE_TLS || "true").toLowerCase() === "true";
 
+// Map: hostname -> { targets: [ip,...], isLocal: bool }
+const mapping = new Map();
+
+// Load hosts.json
 function loadHosts() {
   try {
-    const raw = fs.readFileSync(HOSTS_FILE, "utf8");
-    const json = JSON.parse(raw);
+    const data = fs.readFileSync(HOSTS_FILE, "utf8");
+    const json = JSON.parse(data);
     const map = new Map();
-    for (const [k, v] of Object.entries(json)) {
-      const key = k.toLowerCase().replace(/\.$/, "");
-      if (Array.isArray(v)) map.set(key, v.map(String));
-      else map.set(key, [String(v)]);
+    for (const [host, ips] of Object.entries(json)) {
+      const key = host.toLowerCase().replace(/\.$/, "");
+      map.set(key, Array.isArray(ips) ? ips.map(String) : [String(ips)]);
     }
     return map;
-  } catch (err) {
-    console.warn("Could not load hosts file:", err.message);
+  } catch (e) {
+    console.warn("Failed to load hosts.json:", e.message);
     return new Map();
   }
 }
+
 let hosts = loadHosts();
 fs.watchFile(HOSTS_FILE, { interval: 1000 }, () => {
   console.log("Hosts file changed, reloading...");
   hosts = loadHosts();
 });
 
+// Private IP detection
 function isPrivateIp(ip) {
-  if (!ip || typeof ip !== "string") return false;
+  if (!ip) return false;
   const v4 = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (v4) {
-    const a = +v4[1], b = +v4[2];
-    if (a === 10) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 127) return true;
-    return false;
+    const [a,b] = [Number(v4[1]), Number(v4[2])];
+    return a === 10 || (a === 172 && b >=16 && b <=31) || (a===192 && b===168) || a===127;
   }
-  const ipLower = ip.toLowerCase();
-  if (ipLower === "::1") return true;
-  if (/^f[cd]/.test(ipLower)) return true;
-  if (ipLower.startsWith("fe80:")) return true;
-  return false;
+  const lower = ip.toLowerCase();
+  return lower === "::1" || lower.startsWith("fe80:") || /^f[cd]/.test(lower);
 }
 
-async function forwardToUpstreamWire(dnsWireBuffer, upstream = UPSTREAM) {
-  const headers = {
-    "content-type": "application/dns-message",
-    Accept: "application/dns-message, application/dns-json, */*",
-    "user-agent": "doh-proxy/1.0"
-  };
+// Resolve PROXY_HOST to IPs
+async function resolveProxyHostIPs() {
+  const results = [];
+  try { results.push(...await dns.resolve4(PROXY_HOST).catch(()=>[])); } catch {}
+  try { results.push(...await dns.resolve6(PROXY_HOST).catch(()=>[])); } catch {}
+  return results;
+}
 
-  // Use POST (binary) to upstream DOH
-  const res = await fetch(upstream, {
+// Forward DNS wire to upstream
+async function forwardToUpstreamWire(buf) {
+  const res = await fetch(UPSTREAM, {
     method: "POST",
-    headers,
-    body: dnsWireBuffer,
-    redirect: "follow",
+    headers: {
+      "Content-Type": "application/dns-message",
+      "Accept": "application/dns-message"
+    },
+    body: buf
   });
-
-  const respHeaders = {};
-  res.headers.forEach((v, k) => (respHeaders[k] = v));
   const arrayBuffer = await res.arrayBuffer();
-  return { buffer: Buffer.from(arrayBuffer), status: res.status, headers: respHeaders };
-}
-
-async function forwardToUpstreamJson(name, type = "A", upstream = UPSTREAM) {
-  // Try dns-json style GET; if upstream doesn't support it, this may 404/return different structure
-  const u = new URL(upstream);
-  u.searchParams.set("name", name);
-  u.searchParams.set("type", type);
-  const res = await fetch(String(u), { headers: { Accept: "application/dns-json", "user-agent": "doh-proxy/1.0" } });
-  const json = await res.json().catch(() => null);
   const headers = {};
-  res.headers.forEach((v, k) => (headers[k] = v));
-  return { json, status: res.status, headers };
+  res.headers.forEach((v,k)=>headers[k]=v);
+  return { buffer: Buffer.from(arrayBuffer), headers, status: res.status };
 }
 
-function buildDnsAnswerPacket(queryPacketBuffer, rrList) {
-  const q = dnsPacket.decode(queryPacketBuffer);
-  const response = {
+// Build DNS answer packet
+function buildDnsAnswerPacket(queryBuffer, rrList) {
+  const q = dnsPacket.decode(queryBuffer);
+  return dnsPacket.encode({
     id: q.id,
     type: "response",
-    flags: q.flags || dnsPacket.RECURSION_DESIRED,
+    flags: q.flags,
     questions: q.questions,
-    answers: [],
-    authorities: [],
-    additionals: []
-  };
-
-  for (const rr of rrList) {
-    response.answers.push({
-      name: rr.name,
-      type: rr.type,
-      ttl: rr.ttl || 300,
-      class: rr.class || "IN",
-      data: rr.data
-    });
-  }
-
-  return dnsPacket.encode(response);
+    answers: rrList.map(r => ({ name: r.name, type: r.type, ttl: r.ttl || 300, class: "IN", data: r.data }))
+  });
 }
 
-function questionNameAndTypeFromWire(buf) {
+// Extract first question
+function questionNameAndType(buf) {
   try {
     const p = dnsPacket.decode(buf);
-    if (!p.questions || p.questions.length === 0) return null;
+    if (!p.questions || !p.questions.length) return null;
     const q = p.questions[0];
-    return { name: q.name.replace(/\.$/, ""), type: q.type || "A" };
-  } catch (e) {
-    return null;
-  }
+    return { name: q.name.replace(/\.$/,""), type: q.type || "A" };
+  } catch { return null; }
 }
 
 const app = express();
 
-// collect raw body for any request (so wire-format POSTs are available)
-app.use((req, res, next) => {
+// Raw body parser
+app.use((req,res,next)=>{
   const chunks = [];
-  req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
-    req.rawBody = Buffer.concat(chunks);
-    // also parse JSON if content-type is json for convenience
-    const ct = (req.headers["content-type"] || "").toLowerCase();
-    if (ct.includes("application/json") && req.rawBody.length) {
-      try { req.body = JSON.parse(req.rawBody.toString("utf8")); } catch (e) { /* ignore */ }
-    }
-    next();
-  });
+  req.on("data", c=>chunks.push(c));
+  req.on("end", ()=>{ req.rawBody = Buffer.concat(chunks); next(); });
   req.on("error", next);
 });
 
-// Helper to respond with wire format
-function sendWireResponse(res, buffer) {
-  res.setHeader("content-type", "application/dns-message");
-  res.setHeader("content-length", buffer.length);
-  res.status(200).send(buffer);
-}
-
-// Use RegExp catch-all to avoid path-to-regexp issues
-app.all(/.*/, async (req, res) => {
+// Reverse proxy handler for private targets
+app.use(async (req,res,next)=>{
   try {
-    const accept = (req.headers.accept || "").toLowerCase();
-    const wantsJson = accept.includes("application/dns-json") || req.query.name !== undefined || req.query.type !== undefined;
+    const host = (req.headers.host||"").split(":")[0].toLowerCase();
+    const map = mapping.get(host);
+    if(!map?.isLocal) return next();
+    const targetIp = map.targets[0];
+    if(!targetIp) return next();
 
-    // GET?dns=... (wire base64url)
-    if (req.method === "GET" && req.query.dns) {
-      const dnsParam = req.query.dns.toString();
-      const b64 = dnsParam.replace(/-/g, "+").replace(/_/g, "/");
-      const pad = b64.length % 4;
-      const padded = b64 + (pad ? "=".repeat(4 - pad) : "");
-      const qBuf = Buffer.from(padded, "base64");
+    const url = `${req.protocol || "https"}://${targetIp}${req.originalUrl || req.url}`;
+    const headers = {...req.headers, host};
 
-      const qinfo = questionNameAndTypeFromWire(qBuf);
-      const lowerName = qinfo ? qinfo.name.toLowerCase() : null;
+    const agent = new https.Agent({ rejectUnauthorized: !IGNORE_TLS, servername: host });
+    let upstreamRes;
+    try { upstreamRes = await fetch(url,{ method:req.method, headers, body:req.rawBody, agent }); }
+    catch { upstreamRes = await fetch(url,{ method:req.method, headers, body:req.rawBody }); }
 
-      if (lowerName && hosts.has(lowerName)) {
-        const ipList = hosts.get(lowerName);
-        let rrList = [];
-        const qType = qinfo.type || "A";
-        for (const ip of ipList) {
-          if (qType === "A" && ip.includes(".")) rrList.push({ name: lowerName, type: "A", ttl: 300, data: ip });
-          else if (qType === "AAAA" && ip.includes(":")) rrList.push({ name: lowerName, type: "AAAA", ttl: 300, data: ip });
-          else if (qType === "ANY") {
-            if (ip.includes(".")) rrList.push({ name: lowerName, type: "A", ttl: 300, data: ip });
-            if (ip.includes(":")) rrList.push({ name: lowerName, type: "AAAA", ttl: 300, data: ip });
-          }
-        }
-        if (rrList.length === 0 && ipList.length > 0) {
-          const first = ipList[0];
-          const t = first.includes(":") ? "AAAA" : "A";
-          rrList.push({ name: lowerName, type: t, ttl: 300, data: first });
-        }
-
-        const respBuf = buildDnsAnswerPacket(qBuf, rrList);
-
-        // Forward to upstream DOH (wire) and await it (so forwarding uses DOH protocol)
-        try {
-          const upstreamRes = await forwardToUpstreamWire(qBuf);
-          console.log(`Forwarded ${lowerName} (overrides) to upstream (wire) status=${upstreamRes.status}`);
-        } catch (e) {
-          console.error("Upstream forward (wire) failed:", e.message);
-        }
-
-        return sendWireResponse(res, respBuf);
-      } else {
-        // Not in hosts => proxy to upstream DOH (wire)
-        const upstreamRes = await forwardToUpstreamWire(qBuf);
-        if (upstreamRes.headers["content-type"]) res.setHeader("content-type", upstreamRes.headers["content-type"]);
-        if (upstreamRes.headers["content-encoding"]) res.setHeader("content-encoding", upstreamRes.headers["content-encoding"]);
-        if (upstreamRes.headers["cache-control"]) res.setHeader("cache-control", upstreamRes.headers["cache-control"]);
-        res.status(upstreamRes.status).send(upstreamRes.buffer);
-        return;
-      }
-    } else if (req.method === "POST" && (req.headers["content-type"] || "").indexOf("application/dns-message") !== -1) {
-      // POST wire format
-      const qBuf = req.rawBody || Buffer.alloc(0);
-      const qinfo = questionNameAndTypeFromWire(qBuf);
-      const lowerName = qinfo ? qinfo.name.toLowerCase() : null;
-
-      if (lowerName && hosts.has(lowerName)) {
-        const ipList = hosts.get(lowerName);
-        let rrList = [];
-        const qType = qinfo.type || "A";
-        for (const ip of ipList) {
-          if (qType === "A" && ip.includes(".")) rrList.push({ name: lowerName, type: "A", ttl: 300, data: ip });
-          else if (qType === "AAAA" && ip.includes(":")) rrList.push({ name: lowerName, type: "AAAA", ttl: 300, data: ip });
-          else if (qType === "ANY") {
-            if (ip.includes(".")) rrList.push({ name: lowerName, type: "A", ttl: 300, data: ip });
-            if (ip.includes(":")) rrList.push({ name: lowerName, type: "AAAA", ttl: 300, data: ip });
-          }
-        }
-        if (rrList.length === 0 && ipList.length > 0) {
-          const first = ipList[0];
-          const t = first.includes(":") ? "AAAA" : "A";
-          rrList.push({ name: lowerName, type: t, ttl: 300, data: first });
-        }
-
-        const respBuf = buildDnsAnswerPacket(qBuf, rrList);
-
-        // Forward to upstream DOH (wire) and await it
-        try {
-          const upstreamRes = await forwardToUpstreamWire(qBuf);
-          console.log(`Forwarded ${lowerName} (override) to upstream (wire) status=${upstreamRes.status}`);
-        } catch (e) {
-          console.error("Upstream forward (wire) failed:", e.message);
-        }
-
-        return sendWireResponse(res, respBuf);
-      } else {
-        // Not in hosts - forward to upstream
-        const upstreamRes = await forwardToUpstreamWire(qBuf);
-        if (upstreamRes.headers["content-type"]) res.setHeader("content-type", upstreamRes.headers["content-type"]);
-        if (upstreamRes.headers["content-encoding"]) res.setHeader("content-encoding", upstreamRes.headers["content-encoding"]);
-        if (upstreamRes.headers["cache-control"]) res.setHeader("cache-control", upstreamRes.headers["cache-control"]);
-        res.status(upstreamRes.status).send(upstreamRes.buffer);
-        return;
-      }
-    } else if (wantsJson) {
-      // DNS-JSON style (GET or POST)
-      const name = (req.query.name || (req.body && req.body.name) || "").toString();
-      const type = (req.query.type || (req.body && req.body.type) || "A").toString().toUpperCase();
-
-      if (!name) {
-        res.status(400).json({ Status: 1, Comment: "missing name parameter" });
-        return;
-      }
-
-      const lowerName = name.replace(/\.$/, "").toLowerCase();
-      if (hosts.has(lowerName)) {
-        const ipList = hosts.get(lowerName);
-        const answers = [];
-        for (const ip of ipList) {
-          if ((type === "A" && ip.includes(".")) || type === "ANY") answers.push({ name: lowerName, type: 1, TTL: 300, data: ip });
-          else if ((type === "AAAA" && ip.includes(":")) || type === "ANY") answers.push({ name: lowerName, type: 28, TTL: 300, data: ip });
-        }
-        if (answers.length === 0 && ipList.length > 0) {
-          const first = ipList[0];
-          const t = first.includes(":") ? 28 : 1;
-          answers.push({ name: lowerName, type: t, TTL: 300, data: first });
-        }
-
-        // Forward to upstream dns-json and await
-        try {
-          const upstreamRes = await forwardToUpstreamJson(name, type);
-          console.log(`Forwarded ${name} (override) to upstream (dns-json) status=${upstreamRes.status}`);
-        } catch (e) {
-          console.error("Forward to upstream dns-json failed:", e.message);
-        }
-
-        res.json({ Status: 0, TC: false, RD: true, RA: true, AD: false, CD: false, Question: [{ name: lowerName, type }], Answer: answers });
-        return;
-      } else {
-        // Forward to upstream dns-json
-        try {
-          const upstreamRes = await forwardToUpstreamJson(name, type);
-          if (upstreamRes.json) {
-            res.setHeader("content-type", "application/dns-json; charset=utf-8");
-            res.status(upstreamRes.status).json(upstreamRes.json);
-          } else {
-            res.status(502).json({ Status: 2, Comment: "upstream returned non-json" });
-          }
-        } catch (e) {
-          res.status(502).json({ Status: 2, Comment: "upstream failure", error: e.message });
-        }
-        return;
-      }
-    } else {
-      // Unknown request type - proxy to upstream as-is (try to preserve body and headers)
-      const body = req.rawBody && req.rawBody.length ? req.rawBody : undefined;
-      // Clone headers, but strip hop-by-hop stuff and host
-      const headers = { ...req.headers };
-      delete headers.host;
-      try {
-        const upstreamRes = await fetch(UPSTREAM, {
-          method: "POST",
-            headers: {
-              "Content-Type": "application/dns-message",
-              "Accept": "application/dns-message"
-            },
-         body: body
-	});
-        const buf = Buffer.from(await upstreamRes.arrayBuffer());
-        if (upstreamRes.headers.get("content-type")) res.setHeader("content-type", upstreamRes.headers.get("content-type"));
-        if (upstreamRes.headers.get("content-encoding")) res.setHeader("content-encoding", upstreamRes.headers.get("content-encoding"));
-        res.status(upstreamRes.status).send(buf);
-      } catch (e) {
-        res.status(502).send("Upstream DOH proxy error: " + e.message);
-      }
-    }
-  } catch (err) {
-    console.error("Handler error:", err);
-    res.status(500).send("Internal server error: " + err.message);
-  }
+    upstreamRes.headers.forEach((v,k)=>{
+      if(!["connection","keep-alive","transfer-encoding","upgrade"].includes(k)) res.setHeader(k,v);
+    });
+    res.status(upstreamRes.status);
+    res.send(Buffer.from(await upstreamRes.arrayBuffer()));
+  } catch(e){ console.error("Proxy error:", e); res.status(502).send("Bad Gateway"); }
 });
 
-const server = http.createServer(app);
-server.listen(PORT, () => {
-  console.log(`DOH proxy listening on http://0.0.0.0:${PORT}`);
+// Send wire response helper
+function sendWire(res, buf){
+  res.setHeader("content-type","application/dns-message");
+  res.setHeader("content-length", buf.length);
+  res.status(200).send(buf);
+}
+
+// DoH handler
+app.all(/.*/, async (req,res)=>{
+  try {
+    const accept = (req.headers.accept||"").toLowerCase();
+    const wantsJson = accept.includes("application/dns-json") || req.query.name;
+
+    // DNS wire GET
+    if(req.method==="GET" && req.query.dns){
+      const dnsBuf = Buffer.from(req.query.dns.replace(/-/g,"+").replace(/_/g,"/")+"==","base64");
+      const qinfo = questionNameAndType(dnsBuf);
+      const name = qinfo?.name.toLowerCase();
+      if(name && hosts.has(name)){
+        const ips = hosts.get(name);
+        const local = ips.filter(isPrivateIp);
+        const pub = ips.filter(ip=>!isPrivateIp(ip));
+        if(local.length){
+          const proxyIps = await resolveProxyHostIPs();
+          mapping.set(name,{ targets: local, isLocal:true });
+          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+        }
+        if(pub.length){
+          mapping.set(name,{ targets: pub, isLocal:false });
+          const rr = pub.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+        }
+      }
+      // fallback upstream
+      const upstreamRes = await forwardToUpstreamWire(dnsBuf);
+      res.set(upstreamRes.headers);
+      return res.status(upstreamRes.status).send(upstreamRes.buffer);
+    }
+
+    // DNS wire POST
+    if(req.method==="POST" && (req.headers["content-type"]||"").includes("application/dns-message")){
+      const dnsBuf = req.rawBody || Buffer.alloc(0);
+      const qinfo = questionNameAndType(dnsBuf);
+      const name = qinfo?.name.toLowerCase();
+      if(name && hosts.has(name)){
+        const ips = hosts.get(name);
+        const local = ips.filter(isPrivateIp);
+        const pub = ips.filter(ip=>!isPrivateIp(ip));
+        if(local.length){
+          const proxyIps = await resolveProxyHostIPs();
+          mapping.set(name,{ targets: local, isLocal:true });
+          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+        }
+        if(pub.length){
+          mapping.set(name,{ targets: pub, isLocal:false });
+          const rr = pub.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+        }
+      }
+      const upstreamRes = await forwardToUpstreamWire(dnsBuf);
+      res.set(upstreamRes.headers);
+      return res.status(upstreamRes.status).send(upstreamRes.buffer);
+    }
+
+    // DNS JSON
+    if(wantsJson){
+      const name = (req.query.name||req.body?.name||"").toString();
+      const type = (req.query.type||req.body?.type||"A").toString().toUpperCase();
+      if(!name) return res.status(400).json({ Status:1, Comment:"missing name" });
+
+      const lower = name.toLowerCase();
+      if(hosts.has(lower)){
+        const ips = hosts.get(lower);
+        const local = ips.filter(isPrivateIp);
+        const pub = ips.filter(ip=>!isPrivateIp(ip));
+        if(local.length){
+          const proxyIps = await resolveProxyHostIPs();
+          mapping.set(lower,{ targets: local, isLocal:true });
+          return res.json({ Status:0, Answer: proxyIps.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
+        }
+        if(pub.length){
+          mapping.set(lower,{ targets: pub, isLocal:false });
+          return res.json({ Status:0, Answer: pub.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
+        }
+      }
+      // fallback upstream
+      const u = new URL(UPSTREAM);
+      u.searchParams.set("name", name);
+      u.searchParams.set("type", type);
+      const r = await fetch(String(u), { headers:{ Accept:"application/dns-json" } });
+      const j = await r.json().catch(()=>null);
+      if(j) return res.status(r.status).json(j);
+      return res.status(502).json({ Status:2, Comment:"upstream failed" });
+    }
+
+    return res.status(404).send("Not Found");
+  } catch(e){ console.error(e); return res.status(500).send("Internal error"); }
+});
+
+http.createServer(app).listen(PORT,()=>{
+  console.log(`DOH+Reverse Proxy listening on http://0.0.0.0:${PORT}`);
   console.log(`Upstream DOH: ${UPSTREAM}`);
-  console.log(`Hosts file: ${HOSTS_FILE}`);
+  console.log(`Hosts: ${HOSTS_FILE}`);
+  console.log(`Proxy host: ${PROXY_HOST}`);
+  console.log(`IGNORE_TLS: ${IGNORE_TLS}`);
 });
 
