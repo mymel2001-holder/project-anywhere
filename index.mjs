@@ -41,6 +41,27 @@ fs.watchFile(HOSTS_FILE, { interval: 1000 }, () => {
   hosts = loadHosts();
 });
 
+async function resolveHostsEntry(entry) {
+  const results = [];
+  for (const val of entry) {
+    if (isPrivateIp(val) || val.match(/^\d+(\.\d+){3}$/) || val.includes(":")) {
+      // already IP
+      results.push(val);
+    } else {
+      // hostname -> resolve
+      try {
+        const ips4 = await dns.resolve4(val).catch(()=>[]);
+        const ips6 = await dns.resolve6(val).catch(()=>[]);
+        results.push(...ips4, ...ips6);
+      } catch(e) {
+        console.warn(`Failed to resolve ${val}: ${e.message}`);
+      }
+    }
+  }
+  return results;
+}
+
+
 // Private IP detection
 function isPrivateIp(ip) {
   if (!ip) return false;
@@ -153,7 +174,10 @@ app.all(/.*/, async (req,res)=>{
       const qinfo = questionNameAndType(dnsBuf);
       const name = qinfo?.name.toLowerCase();
       if(name && hosts.has(name)){
-        const ips = hosts.get(name);
+        const rawTargets = hosts.get(name);
+        const ips = await resolveHostsEntry(rawTargets);
+        const localTargets = ips.filter(isPrivateIp);
+        const publicTargets = ips.filter(ip => !isPrivateIp(ip));
         const local = ips.filter(isPrivateIp);
         const pub = ips.filter(ip=>!isPrivateIp(ip));
         if(local.length){
