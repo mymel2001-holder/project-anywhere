@@ -1,4 +1,4 @@
-// server.mjs
+// reverse-doh-proxy.mjs
 import fs from "fs";
 import http from "http";
 import express from "express";
@@ -15,8 +15,7 @@ const PORT = Number(process.env.PORT || 8053);
 const UPSTREAM_DOH = process.env.UPSTREAM_DOH || "https://one.one.one.one/dns-query";
 const HOSTS_FILE = process.env.HOSTS_FILE || "./hosts.json";
 
-// PROXY_PUBLIC_HOST is the hostname exposed by the Cloudflare Tunnel 
-// (e.g., anywhere.nodemixaholic.com). This is the CNAME target.
+// PROXY_PUBLIC_HOST is the hostname exposed by the Cloudflare Tunnel (e.g., anywhere.nodemixaholic.com)
 const PROXY_PUBLIC_HOST = process.env.PROXY_HOST || "anywhere.nodemixaholic.com"; 
 
 let hosts = loadHosts();
@@ -31,7 +30,6 @@ function loadHosts() {
     const json = JSON.parse(data);
     const map = new Map();
     for (const [host, targets] of Object.entries(json)) {
-      // Store hostnames in lowercase, remove trailing dot
       map.set(host.toLowerCase().replace(/\.$/, ""), Array.isArray(targets) ? targets : [String(targets)]);
     }
     return map;
@@ -67,16 +65,32 @@ function buildDnsAnswerPacket(queryBuffer, rrList) {
     type: "response",
     flags: q.flags,
     questions: q.questions,
-    // type: 1=A, 5=CNAME, 28=AAAA
     answers: rrList.map(r => ({ name: r.name, type: r.type, ttl: 60, class:"IN", data: r.data }))
   });
+}
+
+// ** This function was causing the ReferenceError because it was called before its definition in the module structure.
+//    Defining it here resolves the scope issue. **
+async function initProxyConfig() {
+  if (isPrivateIp(PROXY_PUBLIC_HOST) || PROXY_PUBLIC_HOST.match(/^\d+(\.\d+){3}$/)) {
+    PROXY_PUBLIC_IP = PROXY_PUBLIC_HOST;
+  } else {
+    try {
+      console.log(`Resolving PROXY_PUBLIC_HOST (${PROXY_PUBLIC_HOST}) for A record fallback...`);
+      const { address } = await dnsLookup(PROXY_PUBLIC_HOST);
+      PROXY_PUBLIC_IP = address;
+      console.log(`Resolved PROXY_PUBLIC_HOST for A-records: ${PROXY_PUBLIC_IP}`);
+    } catch (e) {
+      console.warn(`Could not resolve PROXY_PUBLIC_HOST, relying solely on CNAME for local targets.`);
+    }
+  }
 }
 
 // --- MIDDLEWARE ---
 
 // Middleware to parse raw DNS wire body
 app.use((req,res,next)=>{
-  if (req.headers["content-type"] === "application/dns-message" || req.method !== 'GET') {
+  if (req.headers["content-type"] === "application/dns-message" || (req.method !== 'GET' && req.headers['content-length'] > 0)) {
     const chunks = [];
     req.on("data", c=>chunks.push(c));
     req.on("end", ()=>{ req.rawBody = Buffer.concat(chunks); next(); });
@@ -86,15 +100,13 @@ app.use((req,res,next)=>{
   }
 });
 
-// 1. DOH HANDLER (Intercepts DNS queries)
+// 1. DOH HANDLER
 app.all("/dns-query", async (req,res)=>{
   const accept = (req.headers.accept||"").toLowerCase();
   const wantsJson = accept.includes("application/dns-json") || req.query.name;
   
   try {
     let dnsBuf = null;
-    let name = null;
-    let type = "A";
 
     // --- A. Handle DNS WIRE format (GET or POST) ---
     if((req.method==="GET" && req.query.dns) || (req.method==="POST" && req.headers["content-type"]==="application/dns-message")){
@@ -103,19 +115,15 @@ app.all("/dns-query", async (req,res)=>{
         : (req.rawBody || Buffer.alloc(0));
       
       const qinfo = questionNameAndType(dnsBuf);
-      name = qinfo?.name.toLowerCase();
-      type = qinfo?.type;
+      const name = qinfo?.name.toLowerCase();
       
-      if(name && hosts.has(name)) {
-        const targets = hosts.get(name);
-        if(targets.some(isPrivateIp)) {
-          // LOCAL TARGET FOUND: Return CNAME pointing to the public tunnel host
-          const rr = [{ name, type: 5, data: PROXY_PUBLIC_HOST }]; // Type 5 is CNAME
-          res.setHeader("content-type","application/dns-message");
-          const responseBuf = buildDnsAnswerPacket(dnsBuf, rr);
-          res.setHeader("content-length", responseBuf.length);
-          return res.status(200).send(responseBuf);
-        }
+      if(name && hosts.has(name) && hosts.get(name).some(isPrivateIp)) {
+        // LOCAL TARGET FOUND: Return CNAME (Type 5)
+        const rr = [{ name, type: 5, data: PROXY_PUBLIC_HOST }];
+        res.setHeader("content-type","application/dns-message");
+        const responseBuf = buildDnsAnswerPacket(dnsBuf, rr);
+        res.setHeader("content-length", responseBuf.length);
+        return res.status(200).send(responseBuf);
       }
       
       // UPSTREAM FORWARD (Wire)
@@ -127,28 +135,24 @@ app.all("/dns-query", async (req,res)=>{
       const arrayBuffer = await upstreamRes.arrayBuffer();
       upstreamRes.headers.forEach((v,k)=>res.setHeader(k,v));
       return res.status(upstreamRes.status).send(Buffer.from(arrayBuffer));
-
     } 
     
-    // --- B. Handle DNS JSON format (Mainly for debugging/clients) ---
+    // --- B. Handle DNS JSON format ---
     else if(wantsJson) {
-      name = (req.query.name||req.body?.name||"").toString().toLowerCase();
-      type = (req.query.type||req.body?.type||"A").toString().toUpperCase();
+      const name = (req.query.name||req.body?.name||"").toString().toLowerCase();
 
-      if(name && hosts.has(name)) {
-        const targets = hosts.get(name);
-        if(targets.some(isPrivateIp)) {
-          // LOCAL TARGET FOUND: Return CNAME pointing to the public tunnel host
+      if(name && hosts.has(name) && hosts.get(name).some(isPrivateIp)) {
+          // LOCAL TARGET FOUND: Return CNAME (Type 5)
           return res.json({ 
             Status:0, 
             Answer: [ 
-              { name, type: 5, TTL: 60, data: PROXY_PUBLIC_HOST } // Type 5 is CNAME
+              { name, type: 5, TTL: 60, data: PROXY_PUBLIC_HOST } 
             ] 
           });
-        }
       }
 
       // UPSTREAM FORWARD (JSON)
+      const type = (req.query.type||req.body?.type||"A").toString().toUpperCase();
       const r = await fetch(`${UPSTREAM_DOH}?name=${name}&type=${type}`,{ headers:{ Accept:"application/dns-json" } });
       const j = await r.json().catch(()=>null);
       if(j) return res.status(r.status).json(j);
@@ -163,32 +167,31 @@ app.all("/dns-query", async (req,res)=>{
   }
 });
 
-// 2. PROXY HANDLER (Intercepts HTTP requests)
-// This must run for all other routes that aren't /dns-query
+// 2. PROXY HANDLER (Stateless HTTP/S Reverse Proxy)
 app.use(async (req, res, next) => {
-  // Extract only the hostname (no port)
   const hostHeader = (req.headers.host || "").split(":")[0].toLowerCase();
 
-  // 1. Check if the requested host is one of our local targets
-  if (!hosts.has(hostHeader)) {
-    // Check if the requested host is the tunnel host itself (handle cases where browser hits the tunnel root)
-    if (hostHeader === PROXY_PUBLIC_HOST.toLowerCase()) {
-        return res.status(404).send(`Proxy tunnel established. Please configure a domain (e.g., samantha.femboy) to proxy.`);
-    }
-    return next(); // Not a target host, pass to next handler (which doesn't exist, so this will 404/500)
+  // If the request is for the public host itself, don't proxy (prevents proxy loop)
+  if (hostHeader === PROXY_PUBLIC_HOST.toLowerCase()) {
+      return next(); 
   }
 
-  // 2. Identify the internal IP/Port
+  // Check if the requested host is one of our local targets
+  if (!hosts.has(hostHeader)) {
+    return next(); 
+  }
+
+  // Identify the internal IP/Port
   const targets = hosts.get(hostHeader);
   const internalTarget = targets.find(t => isPrivateIp(t) || t.includes(":")); 
 
   if (!internalTarget) return next();
 
-  // 3. Proxy the request to the internal service (e.g., 192.168.50.238)
+  // Proxy the request
   try {
     const targetUrl = `http://${internalTarget}${req.originalUrl || req.url}`;
     
-    // CRITICAL FIX: The internal service needs the internal IP/Port as the Host header.
+    // CRITICAL FIX: Use the internal IP/Port as the Host header for the internal request.
     const internalHostHeader = internalTarget; 
     
     const fetchOptions = {
@@ -196,7 +199,7 @@ app.use(async (req, res, next) => {
       // Overwrite the Host header for the internal request
       headers: { ...req.headers, host: internalHostHeader }, 
       redirect: 'manual',
-      // Ensure we can connect to internal HTTP without certificate issues
+      // Allow self-signed certs internally (though we use http:// to avoid this)
       agent: new http.Agent({ rejectUnauthorized: false }) 
     };
 
@@ -206,7 +209,7 @@ app.use(async (req, res, next) => {
 
     const upstreamRes = await fetch(targetUrl, fetchOptions);
 
-    // Forward headers back to the client
+    // Forward headers
     upstreamRes.headers.forEach((v, k) => {
       if (!["content-length", "connection", "keep-alive"].includes(k)) {
         res.setHeader(k, v);
@@ -232,7 +235,7 @@ async function startServer() {
     hosts = loadHosts();
   });
   
-  await initProxyConfig(); // Resolves PROXY_PUBLIC_HOST's IP for logging/A records
+  await initProxyConfig(); 
   
   http.createServer(app).listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Proxy running on port ${PORT}`);
@@ -241,4 +244,5 @@ async function startServer() {
   });
 }
 
+// Execute the startup function
 startServer();
