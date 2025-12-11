@@ -176,10 +176,20 @@ app.all(/.*/, async (req,res)=>{
 
         if(localTargets.length){
           const proxyIps = await resolveProxyHostIPs();
-          mapping.set(name,{ targets: localTargets, isLocal:true });
-          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
-          forwardToUpstreamWire(dnsBuf).catch(()=>{});
-          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+          if(proxyIps.length === 0){
+            console.warn("Could not resolve PROXY_HOST; using 127.0.0.1 as fallback");
+            proxyIps.push("127.0.0.1");
+          }
+
+          mapping.set(lowerName, { targets: localTargets, isLocal: true });
+          const answers = proxyIps.map(ip => ({
+            name: lowerName,
+            type: ip.includes(":") ? 28 : 1,
+            TTL: 300,
+            data: ip
+          }));
+          return res.json({ Status: 0, Answer: answers });
+
         }
 
         if(publicTargets.length){
