@@ -181,7 +181,7 @@ function sendWireResponse(res, buffer) {
 }
 
 // Main route accepts any path (some DOH clients call /dns-query, some root)
-app.all("/:path(*)", async (req, res) => {
+app.all("/*", async (req, res) => {
   try {
     // Determine mode: wire vs json
     const accept = (req.headers.accept || "").toLowerCase();
