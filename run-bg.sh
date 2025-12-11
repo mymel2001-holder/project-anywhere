@@ -1,4 +1,4 @@
 #!/bin/bash
 git pull
 npm i
-node index.js >anywhere.log 2>&1 &
+node index.mjs >anywhere.log 2>&1 &
