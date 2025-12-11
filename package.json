@@ -13,6 +13,16 @@
     "axios": "^1.13.2",
     "body-parser": "^2.2.1",
     "dns-packet": "^5.6.1",
-    "express": "^5.2.1"
-  }
+    "express": "^5.2.1",
+    "http-proxy": "^1.18.1",
+    "node-fetch": "^3.3.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mymel2001-holder/project-anywhere.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mymel2001-holder/project-anywhere/issues"
+  },
+  "homepage": "https://github.com/mymel2001-holder/project-anywhere#readme"
 }
