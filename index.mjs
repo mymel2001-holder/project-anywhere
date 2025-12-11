@@ -12,10 +12,9 @@ const PORT = Number(process.env.PORT || 8053);
 const UPSTREAM = process.env.UPSTREAM_DOH || "https://one.one.one.one/dns-query";
 const HOSTS_FILE = process.env.HOSTS_FILE || "./hosts.json";
 const PROXY_HOST = process.env.PROXY_HOST || "anywhere.nodemixaholic.com";
-const PROXY_PATH = process.env.PROXY_PATH || "/proxy";
 const IGNORE_TLS = (process.env.IGNORE_TLS || "true").toLowerCase() === "true";
 
-// Map: hostname -> { targets: [ip,...], isLocal: bool }
+// Mapping: client queried hostname -> { targets: [IP,...], isLocal: bool }
 const mapping = new Map();
 
 // Load hosts.json
@@ -24,9 +23,8 @@ function loadHosts() {
     const data = fs.readFileSync(HOSTS_FILE, "utf8");
     const json = JSON.parse(data);
     const map = new Map();
-    for (const [host, ips] of Object.entries(json)) {
-      const key = host.toLowerCase().replace(/\.$/, "");
-      map.set(key, Array.isArray(ips) ? ips.map(String) : [String(ips)]);
+    for (const [host, targets] of Object.entries(json)) {
+      map.set(host.toLowerCase().replace(/\.$/, ""), Array.isArray(targets) ? targets : [String(targets)]);
     }
     return map;
   } catch (e) {
@@ -41,53 +39,13 @@ fs.watchFile(HOSTS_FILE, { interval: 1000 }, () => {
   hosts = loadHosts();
 });
 
-async function resolveHostsEntry(entry) {
-  const results = [];
-  for (const val of entry) {
-    if (isPrivateIp(val) || val.match(/^\d+(\.\d+){3}$/) || val.includes(":")) {
-      // already IP
-      results.push(val);
-    } else {
-      // hostname -> resolve
-      try {
-        const ips4 = await dns.resolve4(val).catch(()=>[]);
-        const ips6 = await dns.resolve6(val).catch(()=>[]);
-        results.push(...ips4, ...ips6);
-      } catch(e) {
-        console.warn(`Failed to resolve ${val}: ${e.message}`);
-      }
-    }
-  }
-  return results;
-}
-
-async function getResolvedTargetsForHost(hostname) {
-  const rawTargets = hosts.get(hostname) || [];
-  const resolved = [];
-  for (const t of rawTargets) {
-    if (isPrivateIp(t) || t.match(/^\d+(\.\d+){3}$/) || t.includes(":")) {
-      resolved.push(t);
-    } else {
-      try {
-        resolved.push(...await dns.resolve4(t));
-        resolved.push(...await dns.resolve6(t));
-      } catch(e) {
-        console.warn(`Failed to resolve ${t}: ${e.message}`);
-      }
-    }
-  }
-  return resolved;
-}
-
-
-
-// Private IP detection
+// Detect private/local IPs
 function isPrivateIp(ip) {
   if (!ip) return false;
   const v4 = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (v4) {
     const [a,b] = [Number(v4[1]), Number(v4[2])];
-    return a === 10 || (a === 172 && b >=16 && b <=31) || (a===192 && b===168) || a===127;
+    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a === 127;
   }
   const lower = ip.toLowerCase();
   return lower === "::1" || lower.startsWith("fe80:") || /^f[cd]/.test(lower);
@@ -99,6 +57,25 @@ async function resolveProxyHostIPs() {
   try { results.push(...await dns.resolve4(PROXY_HOST).catch(()=>[])); } catch {}
   try { results.push(...await dns.resolve6(PROXY_HOST).catch(()=>[])); } catch {}
   return results;
+}
+
+// Resolve a list of hostnames/IPs to IPs
+async function resolveHostsEntry(entry) {
+  const resolved = [];
+  for (const t of entry) {
+    if (isPrivateIp(t) || t.match(/^\d+(\.\d+){3}$/) || t.includes(":")) {
+      resolved.push(t);
+    } else {
+      try {
+        const ips4 = await dns.resolve4(t).catch(()=>[]);
+        const ips6 = await dns.resolve6(t).catch(()=>[]);
+        resolved.push(...ips4, ...ips6);
+      } catch(e) {
+        console.warn(`Failed to resolve ${t}: ${e.message}`);
+      }
+    }
+  }
+  return resolved;
 }
 
 // Forward DNS wire to upstream
@@ -149,7 +126,7 @@ app.use((req,res,next)=>{
   req.on("error", next);
 });
 
-// Reverse proxy handler for private targets
+// Reverse proxy for private targets
 app.use(async (req,res,next)=>{
   try {
     const host = (req.headers.host||"").split(":")[0].toLowerCase();
@@ -193,24 +170,26 @@ app.all(/.*/, async (req,res)=>{
       const qinfo = questionNameAndType(dnsBuf);
       const name = qinfo?.name.toLowerCase();
       if(name && hosts.has(name)){
-        const resolvedTargets = await getResolvedTargetsForHost(lowerName);
+        const resolvedTargets = await resolveHostsEntry(hosts.get(name));
         const localTargets = resolvedTargets.filter(isPrivateIp);
         const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
 
-        if (localTargets.length > 0) {
+        if(localTargets.length){
           const proxyIps = await resolveProxyHostIPs();
-          mapping.set(lowerName, { targets: localTargets, isLocal: true }); // <-- key is queried hostname
-          const rrList = proxyIps.map(ip => ({ name: lowerName, type: ip.includes(":") ? "AAAA" : "A", ttl: 300, data: ip }));
-          return sendWireResponse(res, buildDnsAnswerPacket(qBuf, rrList));
+          mapping.set(name,{ targets: localTargets, isLocal:true });
+          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+          forwardToUpstreamWire(dnsBuf).catch(()=>{});
+          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
         }
 
-        if(pub.length > 0){
-          mapping.set(name,{ targets: pub, isLocal:false });
-          const rr = pub.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+        if(publicTargets.length){
+          mapping.set(name,{ targets: publicTargets, isLocal:false });
+          const rr = publicTargets.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
           return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
         }
       }
+
       // fallback upstream
       const upstreamRes = await forwardToUpstreamWire(dnsBuf);
       res.set(upstreamRes.headers);
@@ -223,23 +202,26 @@ app.all(/.*/, async (req,res)=>{
       const qinfo = questionNameAndType(dnsBuf);
       const name = qinfo?.name.toLowerCase();
       if(name && hosts.has(name)){
-        const ips = hosts.get(name);
-        const local = ips.filter(isPrivateIp);
-        const pub = ips.filter(ip=>!isPrivateIp(ip));
-        if(local.length){
+        const resolvedTargets = await resolveHostsEntry(hosts.get(name));
+        const localTargets = resolvedTargets.filter(isPrivateIp);
+        const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
+
+        if(localTargets.length){
           const proxyIps = await resolveProxyHostIPs();
-          mapping.set(name,{ targets: local, isLocal:true });
+          mapping.set(name,{ targets: localTargets, isLocal:true });
           const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
           return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
         }
-        if(pub.length){
-          mapping.set(name,{ targets: pub, isLocal:false });
-          const rr = pub.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
+
+        if(publicTargets.length){
+          mapping.set(name,{ targets: publicTargets, isLocal:false });
+          const rr = publicTargets.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
           return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
         }
       }
+
       const upstreamRes = await forwardToUpstreamWire(dnsBuf);
       res.set(upstreamRes.headers);
       return res.status(upstreamRes.status).send(upstreamRes.buffer);
@@ -253,19 +235,22 @@ app.all(/.*/, async (req,res)=>{
 
       const lower = name.toLowerCase();
       if(hosts.has(lower)){
-        const ips = hosts.get(lower);
-        const local = ips.filter(isPrivateIp);
-        const pub = ips.filter(ip=>!isPrivateIp(ip));
-        if(local.length){
+        const resolvedTargets = await resolveHostsEntry(hosts.get(lower));
+        const localTargets = resolvedTargets.filter(isPrivateIp);
+        const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
+
+        if(localTargets.length){
           const proxyIps = await resolveProxyHostIPs();
-          mapping.set(lower,{ targets: local, isLocal:true });
+          mapping.set(lower,{ targets: localTargets, isLocal:true });
           return res.json({ Status:0, Answer: proxyIps.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
         }
-        if(pub.length){
-          mapping.set(lower,{ targets: pub, isLocal:false });
-          return res.json({ Status:0, Answer: pub.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
+
+        if(publicTargets.length){
+          mapping.set(lower,{ targets: publicTargets, isLocal:false });
+          return res.json({ Status:0, Answer: publicTargets.map(ip=>({ name:lower, type:ip.includes(":")?28:1, TTL:300, data:ip })) });
         }
       }
+
       // fallback upstream
       const u = new URL(UPSTREAM);
       u.searchParams.set("name", name);
@@ -287,4 +272,3 @@ http.createServer(app).listen(PORT,()=>{
   console.log(`Proxy host: ${PROXY_HOST}`);
   console.log(`IGNORE_TLS: ${IGNORE_TLS}`);
 });
-
