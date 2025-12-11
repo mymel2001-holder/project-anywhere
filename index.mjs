@@ -61,6 +61,25 @@ async function resolveHostsEntry(entry) {
   return results;
 }
 
+async function getResolvedTargetsForHost(hostname) {
+  const rawTargets = hosts.get(hostname) || [];
+  const resolved = [];
+  for (const t of rawTargets) {
+    if (isPrivateIp(t) || t.match(/^\d+(\.\d+){3}$/) || t.includes(":")) {
+      resolved.push(t);
+    } else {
+      try {
+        resolved.push(...await dns.resolve4(t));
+        resolved.push(...await dns.resolve6(t));
+      } catch(e) {
+        console.warn(`Failed to resolve ${t}: ${e.message}`);
+      }
+    }
+  }
+  return resolved;
+}
+
+
 
 // Private IP detection
 function isPrivateIp(ip) {
@@ -174,20 +193,18 @@ app.all(/.*/, async (req,res)=>{
       const qinfo = questionNameAndType(dnsBuf);
       const name = qinfo?.name.toLowerCase();
       if(name && hosts.has(name)){
-        const rawTargets = hosts.get(name);
-        const ips = await resolveHostsEntry(rawTargets);
-        const localTargets = ips.filter(isPrivateIp);
-        const publicTargets = ips.filter(ip => !isPrivateIp(ip));
-        const local = ips.filter(isPrivateIp);
-        const pub = ips.filter(ip=>!isPrivateIp(ip));
-        if(local.length){
+        const resolvedTargets = await getResolvedTargetsForHost(lowerName);
+        const localTargets = resolvedTargets.filter(isPrivateIp);
+        const publicTargets = resolvedTargets.filter(ip => !isPrivateIp(ip));
+
+        if (localTargets.length > 0) {
           const proxyIps = await resolveProxyHostIPs();
-          mapping.set(name,{ targets: local, isLocal:true });
-          const rr = proxyIps.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
-          forwardToUpstreamWire(dnsBuf).catch(()=>{});
-          return sendWire(res, buildDnsAnswerPacket(dnsBuf, rr));
+          mapping.set(lowerName, { targets: localTargets, isLocal: true }); // <-- key is queried hostname
+          const rrList = proxyIps.map(ip => ({ name: lowerName, type: ip.includes(":") ? "AAAA" : "A", ttl: 300, data: ip }));
+          return sendWireResponse(res, buildDnsAnswerPacket(qBuf, rrList));
         }
-        if(pub.length){
+
+        if(pub.length > 0){
           mapping.set(name,{ targets: pub, isLocal:false });
           const rr = pub.map(ip=>({ name, type: ip.includes(":")?"AAAA":"A", data: ip }));
           forwardToUpstreamWire(dnsBuf).catch(()=>{});
