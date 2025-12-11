@@ -1,0 +1,18 @@
+{
+  "name": "project-anywhere",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "MyMel2001",
+  "license": "SEE LICENSE IN LICENSE",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "body-parser": "^2.2.1",
+    "dns-packet": "^5.6.1",
+    "express": "^5.2.1"
+  }
+}

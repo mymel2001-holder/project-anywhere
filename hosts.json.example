@@ -1,0 +1,4 @@
+{
+  "router.remote": "192.168.50.1",
+  "cloudflare.dns": "1.1.1.1"
+}
